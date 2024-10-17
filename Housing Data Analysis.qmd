@@ -1,0 +1,623 @@
+---
+title: "Machine_Learning_Final"
+author: "Keith Martin"
+format: html
+editor: visual
+---
+
+```{r}
+suppressMessages({
+  library(tidymodels)
+  library(dplyr)
+  library(tidyverse)
+  library(caret)
+  library(ggplot2)
+  library(ggcorrplot)
+  library(glmnet)
+  library(xgboost)
+  library(tinytex)
+})
+
+```
+
+```{r}
+set.seed(123)
+```
+
+# Motivation
+
+I have a keen interest in real estate investment and aspire to own property someday. However, in today's dynamic environment, numerous factors can influence home prices, making it challenging to navigate. To address this complexity, I aim to harness both supervised and unsupervised learning techniques to construct a robust model. The goal is to accurately predict home prices, enabling me to decipher optimal investment opportunities in the future.
+
+# Exploratory Analysis
+
+## Data Cleaning
+
+As a number of my models necessitate numeric predictors, I selected specific variables for conversion. I focused on two key factors: the status of the garage (differentiating between finished and unfinished) and the overall condition of the house. For simplicity, I grouped 'unfinished' and 'no garage' together, as well as 'refinished' and 'finished garage.' Additionally, I transformed the overall condition of the home into a numeric scale.
+
+```{r}
+ames <- ames %>%
+  mutate(garage_finish = case_when(
+    Garage_Finish == "Fin" ~ 1,
+    Garage_Finish == "No Garage" ~ 0,
+    Garage_Finish == "Unf" ~ 0,
+    Garage_Finish == "RFn" ~ 1,
+    TRUE ~ NA_real_  # Handle other cases, or set to NA if none of the conditions are met
+  ))
+ames <- ames %>%
+  mutate(condition = case_when(
+   Exter_Cond == "Excellent" ~ 4,
+   Exter_Cond == "Good" ~ 3,
+   Exter_Cond == "Typical" ~ 2,
+   Exter_Cond == "Fair" ~ 1,
+   Exter_Cond == "Poor" ~ 0,
+   TRUE ~ NA_real_
+  ))
+
+
+```
+
+Furthermore, I reformatted the 'month sold' and 'year sold' variables into a date format. After the conversion, I selected a reference date (01/01/2001) and calculated the duration in days from that reference date. This approach provides a meaningful numeric value for inclusion in the models.
+
+```{r}
+# Convert the month and date sold to dates
+ames$Date_Sold <- as.Date(paste(ames$Year_Sold, ames$Mo_Sold, "01", sep = "-"), format = "%Y-%m-%d")
+
+```
+
+```{r}
+reference_date <- as.Date("2000-01-01")
+
+# Create a new numeric column representing the number of days since the reference date
+ames$Days_Since_Reference <- as.numeric(ames$Date_Sold - reference_date)
+```
+
+I streamlined the dataset by filtering only numeric values for enhanced usability in the models. As part of this process, I excluded the 'Months sold' and 'Year sold' variables for a more focused analysis.
+
+```{r}
+ames <- ames %>%
+select_if(is.numeric)
+```
+
+```{r}
+ames <- select(ames, -Mo_Sold, -Year_Sold)
+```
+
+# Numerical And Visual Summary
+
+With the data now cleaned, I will proceed to split it into training and test sets, using an 80/20 ratio.
+
+```{r}
+ames_split <- initial_split(ames, prop = 0.8)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+```
+
+```{r}
+dim(ames_train)
+dim(ames_test)
+```
+
+Following the split, the training set comprises 2344 observations with 35 columns, while the testing set consists of 586 observations with an equivalent number of columns.
+
+```{r}
+ggplot(ames, aes(x = seq_along(Sale_Price), y = Sale_Price)) +
+  geom_point() +
+  labs(title = "Scatterplot of Sale Price",
+       x = "Observation",
+       y = "Sale_Price") +
+  theme_minimal()
+```
+
+The sale prices distribution lacks a normal shape, indicating that linear regression might not be the optimal model for predicting prices. However, a more thorough analysis is required. Notably, there are outliers in the data. To mitigate their influence, median values will be utilized for imputing missing data in each column.
+
+```{r}
+summary(ames$Sale_Price)
+```
+
+The summary statistics for the dataset indicate a minimum sale price of \$12,789, a median of \$160,000, and a maximum of \$755,000. The mean sale price is approximately \$180,796, with the third quartile at \$213,500.
+
+```{r}
+Q1 <- quantile(ames$Sale_Price, 0.25)
+Q3 <- quantile(ames$Sale_Price, 0.75)
+IQR <- Q3 - Q1
+
+# Define the lower and upper bounds for outliers
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+
+# Identify outliers
+outliers <- ames$Sale_Price < lower_bound | ames$Sale_Price > upper_bound
+
+# Display the outliers
+outlier_values <- ames$Sale_Price[outliers]
+print(outlier_values)
+```
+
+I've included the outliers in the dataset intentionally. Some features may influence house prices in ways we aim to capture in our regressions. Moreover, retaining as much data as possible is essential given the dataset's size.
+
+I stored the Sale_Price variables into their own variables so that it would not interfere with the principal component analysis.
+
+```{r}
+#store sale_price variables just in case necessary later
+sale_price_train <- ames_train$Sale_Price
+sale_price_test <- ames_test$Sale_Price
+
+ames_train <- select(ames_train, -Sale_Price)
+ames_test <- select(ames_test, -Sale_Price)
+
+
+
+```
+
+```{r}
+ames_train <- as_tibble(ames_train)
+ames_test <- as_tibble(ames_test)
+```
+
+To address missing values, I employ data imputation by replacing them with the medians of their respective columns. Importantly, I derive the median values from the training set and apply them to impute missing values in the test set, minimizing the risk of data leakage.
+
+```{r}
+#Replace NAs with median
+for (i in 1:ncol(ames_train)) {
+  if (is.numeric(ames_train[[i]]) && any(is.na(ames_train[[i]]) | !is.finite(ames_train[[i]]))) {
+    # Replace missing or infinite values with the column-wise median
+    col_median <- median(ames_train[[i]], na.rm = TRUE)
+    ames_train[is.na(ames_train[[i]]) | !is.finite(ames_train[[i]]), i] <- col_median
+  }
+}
+
+
+```
+
+```{r}
+#imput the medians from training columns into the test dataset (chatGPT assisted)
+
+medians <- sapply(ames_train, function(x) if (is.numeric(x)) median(x, na.rm = TRUE) else NA)
+
+# Impute missing values in ames_test using medians from ames_train
+for (i in 1:ncol(ames_test)) {
+  if (is.numeric(ames_test[[i]]) && any(is.na(ames_test[[i]]))) {
+    ames_test[is.na(ames_test[[i]]), i] <- medians[i]
+  }
+}
+```
+
+This confirms there are no more NAs in the data.
+
+```{r}
+any(is.na(ames_train))
+```
+
+For principal component analysis and the ridge regression, I scaled the data sets. I use the scaled values from training data on the test set to avoid any data leakage.
+
+```{r}
+ames_train_scaled <- scale(ames_train)
+```
+
+```{r}
+# Calculate center and scale based on ames_train_scaled
+center <- colMeans(ames_train_scaled, na.rm = TRUE)
+scale <- apply(ames_train_scaled, 2, sd, na.rm = TRUE)
+
+# Scale ames_test using the center and scale from ames_train_scaled
+ames_test_scaled <- scale(ames_test, center = center, scale = scale)
+
+```
+
+In order to visualize the relationships, I used principal component analysis. By identifying principal components---uncorrelated linear combinations of original features---PCA allows for a reduction in the number of features while retaining essential patterns and structures in the data. This process not only simplifies the dataset but also aids in noise reduction and computational efficiency. PCA achieves this through linear algebra methods like eigenvalue decomposition or singular value decomposition, emphasizing variance retention and providing a way to visualize complex data in two or three dimensions. Applied primarily during preprocessing, PCA is valuable for handling datasets with correlated features or those with a high feature-to-sample ratio, contributing to improved model interpretability and performance.
+
+```{r}
+#Perform PCA Analysis
+
+# Performing principal component analysis
+# followed example from class
+pc_train <- prcomp(ames_train_scaled, center = F, scale = F)
+
+names(pc_train)
+
+pc_train$rotation <- -pc_train$rotation
+# viewing summary
+summary(pc_train)
+```
+
+The summary of the principal component analysis (PCA) reveals that 34 principal components effectively capture the variance present in the dataset's predictors. Notably, the proportion of variance exhibited by these components demonstrates an interesting pattern. Initially, there is a rapid decline in variance explained after the first few principal components, indicating that these components account for a substantial portion of the overall variance.
+
+However, beyond the initial drop, the rate of increase in explained variance becomes more steady and consistent, particularly after approximately 5 principal components. This suggests that a diminishing number of principal components are needed to capture additional variance in the data. Eventually, as we progress through the components, the cumulative variance explained approaches 100%, indicating that the selected principal components collectively account for the entire variability within the dataset. This observation provides insights into the optimal number of principal components required to effectively represent the dataset while minimizing redundancy.
+
+```{r}
+#Store actual principal component values
+pc_scores_train <- pc_train$x
+```
+
+```{r}
+#Proportion of variance explained by each principal component
+
+# Get the proportion of variance explained by each principal component
+prop_variance_explained <- pc_train$sdev^2 / sum(pc_train$sdev^2)
+
+# Create a scree plot
+plot(prop_variance_explained, type = 'b', xlab = 'Principal Component', ylab = 'Proportion of Variance Explained',
+     main = 'Scree Plot for PCA')
+
+# Add a legend
+legend('topright', legend = c('Variance Explained'),
+       col = c('black'), lty = 1, cex = 0.8)
+```
+
+Examining the scree plot generated by the Principal Component Analysis, it is evident that the proportion of explained variance experiences a noticeable decline after the first 5 principal components, persisting until it reaches full explanation at 34 principal components. In the context of our regression models, we have decided to employ the first 15 principal components. This choice aims to strike a balance between capturing essential information and mitigating the risk of overfitting. Subsequent analysis will help ascertain whether this selection proves to be appropriate or if adjustments are necessary to avoid overfitting.
+
+```{r}
+plot(cumsum(prop_variance_explained), type = 'b', xlab = 'Principal Component', ylab = 'Proportion of Variance Explained',
+     main = 'Scree Plot for PCA')
+
+# Add cumulative variance explained as a line plot
+cumulative_variance <- cumsum(prop_variance_explained)
+lines(cumulative_variance, type = 'b', col = 'red')
+
+# Add a legend
+legend('topleft', legend = c('Cumulative Variance'),
+       col = c('red'), lty = 1, cex = 0.5)
+```
+
+Displayed above is an additional graph illustrating a more gradual relationship in the proportion of explained variance across principal components. Notably, the variance demonstrates a consistent and incremental increase as we progress through the components until it attains 1 or 100% of the variance explained. This observation underscores the systematic nature of the variance captured by the principal components, providing valuable insights into the cumulative explanatory power as each component is considered.
+
+```{r}
+#check correlation matrix from principal component scores and the scaled data set
+# changing PC signs
+
+matrix<-cor(pc_scores_train, -ames_train_scaled)
+
+ggcorrplot(matrix)
+
+```
+
+I've integrated a heatmap showcasing the correlation between principal components and the original predictors. Notably, the first principal component reveals strong correlations with a variety of predictors such as year, bathrooms, garage area, total rooms, and more. While several other relationships are apparent, it's crucial to observe that the correlation tends to decrease with higher principal components.
+
+This phenomenon highlights the substantial impact of the first principal component on the mentioned variables, offering valuable insights into the relationships encapsulated by these components in the dataset.
+
+# Evaluation Metric
+
+RMSE is a widely used metric in regression for its sensitivity to errors, differentiability, interpretability, and comprehensive evaluation of overall model accuracy. Penalizing larger errors more significantly, RMSE is suitable for optimization algorithms during training. Its expression in the same units as the target variable aids in understanding and communicating model performance.
+
+# Model Fitting
+
+In this analysis, I employ three regression techniques. The initial approach involves linear regression utilizing the first 15 principal components. Subsequently, two ridge regression models are implemented: one utilizing the standard predictors and another incorporating the principal components. Finally, a boosted model is employed. The sequencing of these models is structured based on their interpretability, with linear regression being the most interpretable, followed by ridge regression models, and the boosted model considered the least interpretable.
+
+## Linear Model with Principal Components
+
+First, we add sale price back into the model.
+
+```{r}
+#Bind Principal Components
+ames_train_scaled <- as.data.frame(cbind(ames_train_scaled,pc_scores_train))
+
+#Add Sale_Price back into the model
+ames_train_scaled$Sale_Price <- sale_price_train
+
+```
+
+Then we create the model with the principal components.
+
+```{r}
+#create a linear model
+
+model<- lm(log(Sale_Price) ~ PC1 + PC2 + PC3 + PC4 + PC5 + PC6 +PC7 + PC8 +PC9 + PC10 + PC11 + PC12 + PC13 + PC14 +PC15, data = ames_train_scaled)
+
+```
+
+Then we will calculate the RMSE of
+
+```{r}
+pc_scores_test <- predict(pc_train, newdata = ames_test_scaled)
+ames_test_scaled <- as.data.frame(cbind(ames_test_scaled, pc_scores_test))
+```
+
+```{r}
+train_pred <- predict(model, new_data =ames_train_scaled)
+
+df_train <- data.frame(sale_price_pred = train_pred, sale_price_train = sale_price_train)
+
+rmse <- sqrt(mean((df_train$sale_price_pred - df_train$sale_price_train)^2))
+
+# Print the RMSE
+cat("Root Mean Squared Error (RMSE) fpr Training Set:", rmse, "\n")
+```
+
+We find that the Root Mean Squared Error for the training set is 196241.1. We will compare this with the RMSE of the test set to determine the quality of the fit.
+
+```{r}
+linear_pred <- predict(model, newdata = ames_test_scaled)
+```
+
+```{r}
+df <- data.frame(sale_price_pred = linear_pred, sale_price_true = sale_price_test)
+
+```
+
+```{r}
+df <- as.data.frame(lapply(df, as.numeric))
+```
+
+```{r}
+
+if (any(is.na(df$sale_price_pred)) || any(is.na(df$sale_price_true)) ||
+    any(!is.numeric(df$sale_price_pred)) || any(!is.numeric(df$sale_price_true))) {
+  print("Data contains missing values or non-numeric entries.")
+} else {
+  # Calculate MSE
+  mse <- mean((df$sale_price_true - df$sale_price_pred)^2)
+  
+  # Calculate RMSE
+  rmse <- sqrt(mse)
+  
+  print(rmse)
+}
+
+```
+
+In the context of linear regression, the Root Mean Squared Error (RMSE) of 196241.1 on the training set and 203151.3 on the test set indicates a challenging situation for the model. A high RMSE on the training set suggests potential bias, implying that the model may not be capturing the underlying patterns in the data adequately. The even higher RMSE on the test set raises concerns about overfitting, suggesting that the model struggles to generalize well to new, unseen data.
+
+Regarding Principal Component Analysis (PCA), its limitations still apply. While PCA can be useful for dimensionality reduction, it might not always enhance predictive performance in linear regression, especially if the relationship between features and the target variable is not well-captured by linear combinations of the features.
+
+## Ridge Regression
+
+```{r}
+ames_train$Sale_Price <- sale_price_train
+```
+
+```{r}
+ridge_spec <- linear_reg(penalty = 0, mixture = 0) %>%
+    set_mode('regression') %>%
+    set_engine("glmnet")
+
+ridge_mod <- ridge_spec %>%
+  fit(Sale_Price ~ ., data = ames_train)
+tidy(ridge_mod, penalty = 0)
+tidy(ridge_mod, penalty = 1000)
+ridge_mod |> autoplot()
+```
+
+This visualization illustrates the process of Ridge Regression, a regularization technique. Ridge Regression identifies features that contribute significantly to the variance and applies a penalty to the magnitudes of their coefficients during model training. In this representation, Kitchen Average, latitude, and longitude are highlighted as impactful features on the variance. The regularization term is then applied to these coefficients, ensuring that their magnitudes are controlled to prevent overfitting and enhance the model's generalization to new data.
+
+```{r}
+#add sale price back into the model
+ames_test_scaled$Sale_Price <- sale_price_test
+ames_train$Sale_Price <- sale_price_train
+#create folds for cross validation 
+ames_fold <- vfold_cv(ames_train, v = 5)
+#Create the ridge regression recipe that automatically scales using normalize
+ridge_recipe <- 
+  recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_normalize(all_predictors())
+#Specify the model to be ridge regression
+ridge_spec <- 
+  linear_reg(penalty = tune(), mixture = 0) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+#create workflow
+ridge_workflow <- workflow() %>% 
+  add_recipe(ridge_recipe) %>% 
+  add_model(ridge_spec)
+#Create Penalty Grid
+penalty_grid <- grid_regular(penalty(range = c(-5, 5)), levels = 50)
+#Tune the model and cross validate to find best lamda score
+tune_res <- 
+  ridge_workflow %>% 
+  tune_grid(resamples = ames_fold, grid = penalty_grid) 
+#Plot the model
+autoplot(tune_res)
+
+```
+
+Shown above is a visual representation of the regularization values (alpha). This marks the point where the optimal alpha is determined, which will be employed in ridge regression to regularize features and mitigate overfitting.
+
+```{r}
+
+#Select the best penalty based on 
+best_penalty <- select_best(tune_res, metric = "rmse")
+#Fit the model on the training data
+ridge_final <- finalize_workflow(ridge_workflow, best_penalty)
+ridge_final_fit <- fit(ridge_final, data = ames_train)
+
+
+```
+
+```{r}
+#Predict Results
+ridge_pred<- predict(ridge_final_fit, ames_test)
+ridge_train <- predict(ridge_final_fit, ames_train)
+#Put in dataframe
+df_ridge_train <- data.frame(sale_price_pred = ridge_train, sale_price_true = sale_price_train)
+
+df_ridge <- data.frame(sale_price_pred = ridge_pred, sale_price_true = sale_price_test)
+#Calculate RMSE for training
+rmse <- sqrt(mean((df_ridge_train$.pred - df_ridge_train$sale_price_true)^2))
+
+# Print the RMSE
+cat("Root Mean Squared Error (RMSE) of the training set:", rmse, "\n")
+#Calculate RMSE for Test
+rmse <- sqrt(mean((df_ridge$.pred - df_ridge$sale_price_true)^2))
+
+# Print the RMSE
+cat("Root Mean Squared Error (RMSE) of the test set:", rmse, "\n")
+
+```
+
+The Ridge Regression model exhibits a Root Mean Squared Error (RMSE) of 36602.38 on the training set and 35090.15 on the test set. A higher RMSE on the training set suggests the potential presence of bias, indicating that the model may not sufficiently capture the complexity of the underlying patterns in the data. However, the lower RMSE on the test set compared to the training set is a positive sign, indicating good generalization performance. This suggests that the model is not overfitting to the training data, striking a reasonable balance between bias and variance. The model seems to generalize well to new, unseen data, suggesting that it is not overly simplistic (underfitting) nor too complex (overfitting). Overall, these results imply a well-tuned Ridge Regression model with a favorable bias-variance tradeoff.
+
+Despite these considerations, it's essential to recognize the benefits of employing a ridge regression approach. Ridge regression, by introducing regularization to the linear regression model, helps mitigate the risk of overfitting, particularly when dealing with a high-dimensional dataset. The regularization term, controlled by the hyperparameter (alpha), prevents coefficients from becoming excessively large, promoting a more stable and generalized model. This regularization is especially advantageous when dealing with multicollinearity among predictors.
+
+In conclusion, while the observed RMSE values indicate areas for model refinement to enhance generalization, the incorporation of ridge regression provides a valuable regularization mechanism that contributes to the stability and robustness of the model, particularly in scenarios with potential multicollinearity. Further fine-tuning and exploration of regularization strengths may lead to an optimized model that strikes a better balance between bias and variance, ultimately improving its performance across diverse datasets.
+
+Below are the same calculations as above using the tidymodels framework.
+
+```{r}
+ames_test$Sale_Price <- sale_price_test
+
+predict(ridge_mod, new_data = ames_train, penalty = 0) %>%
+  bind_cols(ames_train) %>%
+  metrics(truth = Sale_Price, estimate = .pred)
+```
+
+```{r}
+predict(ridge_mod, new_data = ames_test, penalty = 0) %>%
+  bind_cols(ames_test) %>%
+  metrics(truth = Sale_Price, estimate = .pred)
+
+```
+
+## Ridge using GLM
+
+In this ridge regression, I will use the principal components as the predictors using the GLM package
+
+```{r}
+predictors <- ames_train_scaled %>%
+  select(PC1, PC2,  PC3, PC4,  PC5,  PC6, PC7,  PC8, PC9,  PC10,  PC11, PC12 , PC13, PC14, PC15)
+predictors <- as_tibble(predictors)
+
+penalty_grid <- 10^seq(10, -2, length = 100)
+```
+
+```{r}
+cv.ridge <- cv.glmnet(x = as.matrix(predictors), y = ames_train_scaled$Sale_Price, alpha = 0, nfolds = 5, lambda = penalty_grid)
+plot(cv.ridge)
+lambda_ridge <- cv.ridge$lambda.min
+```
+
+```{r}
+lambda_ridge <- cv.ridge$lambda.min
+lambda_ridge
+```
+
+```{r}
+#Put a lamda in the predict function
+predicted_ridge <- predict(cv.ridge, newx = as.matrix(predictors), s= lambda_ridge)#Can be training or test data, can use lambda min
+
+rmse_ridge <- sqrt(mean((predicted_ridge - ames_train_scaled$Sale_Price)^2))
+rmse_ridge
+
+cat("The RMSE of the Outcome Ridge is", rmse_ridge, "\n")
+```
+
+```{r}
+test_predictors <- ames_test_scaled %>%
+  select(PC1, PC2,  PC3, PC4,  PC5,  PC6, PC7,  PC8, PC9,  PC10,  PC11, PC12 , PC13, PC14, PC15)
+```
+
+```{r}
+final_model <- glmnet(x = as.matrix(predictors), y = ames_train_scaled$Sale_Price, alpha = 0, lambda = lambda_ridge)#Put new lamda here
+
+# Assuming 'lambda_ridge' is defined
+# Make predictions on the test set
+final_predict <- predict(final_model, s = lambda_ridge, newx = as.matrix(test_predictors))
+
+```
+
+```{r}
+df_ridge2 <- data.frame(sale_price_pred = final_predict, sale_price_true = sale_price_test)
+
+```
+
+```{r}
+# Calculate squared differences
+df_ridge2$error_squared <- (df_ridge2$s1 - df_ridge2$sale_price_true)^2
+
+# Calculate mean squared error
+mse <- mean(df_ridge2$error_squared)
+
+# Calculate RMSE
+rmse <- sqrt(mse)
+
+# Print RMSE
+cat("RMSE for Component Ridge Analysis:", rmse, "\n")
+```
+
+The Ridge Regression models based on different sets of predictors yield distinct outcomes, and it's important to note that cross-validation was employed in the analysis. The model utilizing the original features, referred to as Outcome Ridge, exhibits a low training Root Mean Squared Error (RMSE) of 38656.36, indicating a strong fit to the training data. In contrast, the model employing Principal Component Analysis (PCA) predictors, denoted as Component Ridge Analysis, shows a significantly higher RMSE of 138603.1. This cross-validated result suggests that the reduction in dimensionality achieved through PCA might not have led to improved predictive performance, and crucial information may have been lost.
+
+# Boosted Tree Method
+
+```{r}
+
+# Assuming you have loaded your ames_train and ames_test datasets
+# Assuming your dependent variable is 'Sale_Price'
+
+# Define the recipe
+ames_recipe <- recipe(Sale_Price ~ ., data = ames_train) %>%
+  step_nzv(all_predictors()) %>%
+  step_corr(all_predictors(), threshold = 0.9) %>%
+  step_dummy(all_nominal(), one_hot = TRUE)
+
+# Define the boosted model
+boost_model <- boost_tree(trees = 1000, mtry = 5) %>%
+  set_mode("regression") %>%
+  set_engine("xgboost")
+
+# Combine recipe and model into a workflow
+boost_workflow <- workflow() %>%
+  add_recipe(ames_recipe) %>%
+  add_model(boost_model)
+
+# Specify 5-fold cross-validation
+cv <- vfold_cv(ames_train, v = 5)
+
+# Tune the hyperparameters using cross-validation
+boost_tuned <- boost_workflow %>%
+  tune_grid(resamples = cv, grid = 10) %>%
+  collect_metrics()
+
+# Find the best hyperparameters
+best_params <- boost_tuned %>%
+  filter(.metric == "rmse") %>%
+  filter(mean == min(mean)) %>%
+  select(-mean)
+
+# Train the final model using the best hyperparameters
+final_boost_model <- boost_workflow %>%
+  finalize_workflow(best_params) %>%
+  fit(ames_train)
+
+#Make Predictions on AMES_Train
+predictions_train <- predict(final_boost_model, new_data = ames_train)
+
+# Make predictions on ames_test
+predictions_test <- predict(final_boost_model, new_data = ames_test)
+
+
+
+```
+
+```{r}
+df_train_boost <- data.frame(sale_price_pred = predictions_train, sale_price_true = sale_price_train)
+rmse_train <- sqrt(mean((df_train_boost$.pred - df_train_boost$sale_price_true)^2))
+
+# Print the RMSE
+cat("Root Mean Squared Error (RMSE) on the training set:", rmse_train, "\n")
+```
+
+```{r}
+df_test_boost <- data.frame(sale_price_pred = predictions_test, sale_price_true = sale_price_test)
+rmse_test <- sqrt(mean((df_test_boost$.pred - df_test_boost$sale_price_true)^2))
+
+# Print the RMSE
+cat("Root Mean Squared Error (RMSE) on the test set:", rmse_test, "\n")
+```
+
+The discussion on boosted tree models highlights their effectiveness in fitting complex patterns within training data, resulting in impressively low training set errors. The emphasis on precision aligns with their ability to sequentially correct errors and capture intricate relationships. However, the noteworthy risk of overfitting raises concerns about the model's ability to generalize to new, unseen data. This dilemma reflects the inherent bias-variance tradeoff, where a model's complexity (low training set error) may lead to overfitting and hinder generalization. The conclusion aptly recognizes the exceptional predictive capabilities of boosted tree models but underscores the need for a balanced and robust model. Achieving this balance requires diligent evaluation, regularization, and cross-validation to navigate the bias-variance tradeoff and ensure effective generalization to new data.
+
+In conclusion, boosted tree models, exemplified by XGBoost, demonstrate remarkable predictive capabilities with the lowest RMSE in this case. However, their inherent complexity makes them the least interpretable among the three models. Balancing this trade-off necessitates careful evaluation, regularization, and cross-validation to ensure effective generalization to new data.
+
+## Model Conclusions
+
+While linear regression is known for its interpretability, utilizing results from principal component analysis (PCA) yields a high Root Mean Squared Error (RMSE) for both the training and test sets. This implies that a standard linear relationship might not effectively capture the true complexity of the sale price's relationship with the predictors. Moreover, the high RMSE suggests the possibility of important information being lost during the principal component analysis, highlighting potential limitations in the reduction of dimensionality.
+
+The Ridge regression with scaled predictors demonstrated promising outcomes, yielding notably lower RMSE values for both the training and test sets. Notably, the test set RMSE was even lower than that of the training set, signaling positive generalization performance and a balanced model in terms of bias and variance. While Ridge regression is somewhat less interpretable than standard linear regression, it maintains better interpretability compared to a boosted tree model.
+
+In contrast, employing Principal Component Analysis (PCA) predictors in the Ridge regression yielded significantly different results. Specifically, the Component Ridge Analysis showed a substantially higher cross-validated RMSE of 138603.1. This outcome suggests that the dimensionality reduction achieved through PCA might not have improved predictive performance, indicating potential loss of critical information.
+
+In conclusion, the boosted tree model exhibited the lowest RMSE on the test results, showcasing its superior predictive performance. While the model achieved an impressive RMSE of 0.66 on the training set, indicative of its ability to minimize errors, it's important to acknowledge its susceptibility to overfitting. Despite delivering the best results in this case, it's worth noting that the boosted tree model is the least interpretable, posing challenges in explaining its outcomes to non-professionals.
+
+# Ethical Implications
+
+Ethical considerations arise if a large institution were to refine and perfect the model further. A more accurate prediction of home values could potentially be leveraged by large companies to identify undervalued homes, exacerbating the challenge of pricing first-time homebuyers out of the market.Moreover, the inclusion of location variables (latitude and longitude) among the predictors poses the risk of the model making predictions that might contribute to gentrification, potentially adversely affecting protected populations.
+
+As a predictive model, its mere existence is not inherently ethically harmful. However, ethical concerns emerge when the predictions translate into actions. The economic implications depend on the specific use of these predictions.
